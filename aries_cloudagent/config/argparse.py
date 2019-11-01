@@ -233,6 +233,12 @@ class DebugGroup(ArgumentGroup):
             action="store_true",
             help="Flag specifying the generated invite should be public."
         )
+        parser.add_argument(
+            "--test-suite-endpoint",
+            type=str,
+            metavar="<endpoint>",
+            help="URL endpoint for sending messages to the test suite agent."
+        )
 
         parser.add_argument(
             "--auto-accept-invites",
@@ -318,6 +324,8 @@ class DebugGroup(ArgumentGroup):
             settings["debug.invite_multi_use"] = True
         if args.invite_public:
             settings["debug.invite_public"] = True
+        if args.test_suite_endpoint:
+            settings["debug.test_suite_endpoint"] = args.test_suite_endpoint
 
         if args.auto_respond_credential_proposal:
             settings["debug.auto_respond_credential_proposal"] = True
@@ -474,6 +482,8 @@ class LoggingGroup(ArgumentGroup):
 class ProtocolGroup(ArgumentGroup):
     """Protocol settings."""
 
+    GROUP_NAME = "Protocol"
+
     def add_arguments(self, parser: ArgumentParser):
         """Add protocol-specific command line arguments to the parser."""
         parser.add_argument(
@@ -524,6 +534,30 @@ class ProtocolGroup(ArgumentGroup):
             settings["public_invites"] = True
         if args.timing:
             settings["timing.enabled"] = True
+        return settings
+
+
+@group(CAT_START)
+class QueueGroup(ArgumentGroup):
+    """Queue settings."""
+
+    GROUP_NAME = "Queue"
+
+    def add_arguments(self, parser: ArgumentParser):
+        """Add queue-specific command line arguments to the parser."""
+        parser.add_argument(
+            "--enable-undelivered-queue",
+            action="store_true",
+            help="Enable the outbound undelivered queue that enables this agent to hold messages\
+            for delivery to agents without an endpoint. This option will require\
+            additional memory to store messages in the queue.",
+        )
+
+    def get_settings(self, args: Namespace):
+        """Extract queue settings."""
+        settings = {}
+        settings["queue.enable_undelivered_queue"] = args.enable_undelivered_queue
+
         return settings
 
 

@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 from ...error import BaseError
 from ...classloader import ClassLoader, ModuleLoadError, ClassNotFoundError
 from ...messaging.outbound_message import OutboundMessage
+from ...stats import Collector
 from ...task_processor import TaskProcessor
 
 from .base import BaseOutboundTransport, OutboundTransportRegistrationError
@@ -25,7 +26,9 @@ class OutboundDeliveryError(BaseError):
 class OutboundTransportManager:
     """Outbound transport manager class."""
 
-    def __init__(self, queue: BaseOutboundMessageQueue = None):
+    def __init__(
+        self, queue: BaseOutboundMessageQueue = None, collector: Collector = None
+    ):
         """
         Initialize a `OutboundTransportManager` instance.
 
@@ -41,6 +44,7 @@ class OutboundTransportManager:
         self.running_transports = {}
         self.startup_tasks = []
         self.class_loader = ClassLoader(MODULE_BASE_PATH, BaseOutboundTransport)
+        self.collector = collector
 
     def register(self, module_path):
         """
@@ -104,6 +108,7 @@ class OutboundTransportManager:
     async def start_transport(self, schemes, transport_cls):
         """Start the transport."""
         transport = transport_cls()
+        transport.collector = self.collector
         await transport.start()
         self.running_transports[schemes] = transport
 
@@ -145,7 +150,9 @@ class OutboundTransportManager:
         self.processor = TaskProcessor(max_pending=10)
         async for message in self.queue:
             await self.processor.run_retry(
-                lambda pending: self.dispatch_message(message, pending.attempts + 1),
+                lambda pending, msg=message: self.dispatch_message(
+                    msg, pending.attempts + 1
+                ),
                 retries=5,
                 retry_delay=10.0,
             )

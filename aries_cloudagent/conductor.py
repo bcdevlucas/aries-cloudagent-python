@@ -10,9 +10,11 @@ wallet.
 
 import asyncio
 from collections import OrderedDict
+import hashlib
 import logging
 from typing import Coroutine, Union
 
+from .delivery_queue import DeliveryQueue
 from .admin.base_server import BaseAdminServer
 from .admin.server import AdminServer
 from .config.default_context import ContextBuilder
@@ -63,6 +65,7 @@ class Conductor:
         self.inbound_transport_manager: InboundTransportManager = None
         self.outbound_transport_manager: OutboundTransportManager = None
         self.sockets = OrderedDict()
+        self.undelivered_queue: DeliveryQueue = None
 
     async def setup(self):
         """Initialize the global request context."""
@@ -71,6 +74,10 @@ class Conductor:
 
         # Populate message serializer
         self.message_serializer = await context.inject(MessageSerializer)
+
+        # Setup Delivery Queue
+        if context.settings.get("queue.enable_undelivered_queue"):
+            self.undelivered_queue = DeliveryQueue()
 
         # Register all inbound transports
         self.inbound_transport_manager = InboundTransportManager()
@@ -87,9 +94,14 @@ class Conductor:
                 self.logger.exception("Unable to register inbound transport")
                 raise
 
+        # Fetch stats collector, if any
+        collector = await context.inject(Collector, required=False)
+
         # Register all outbound transports
         outbound_queue = await context.inject(BaseOutboundMessageQueue)
-        self.outbound_transport_manager = OutboundTransportManager(outbound_queue)
+        self.outbound_transport_manager = OutboundTransportManager(
+            outbound_queue, collector
+        )
         outbound_transports = context.settings.get("transport.outbound_configs") or []
         for outbound_transport in outbound_transports:
             try:
@@ -118,7 +130,6 @@ class Conductor:
         self.context = context
         self.dispatcher = Dispatcher(self.context)
 
-        collector = await context.inject(Collector, required=False)
         if collector:
             # add stats to our own methods
             collector.wrap(
@@ -177,6 +188,23 @@ class Conductor:
             public_did,
             self.admin_server,
         )
+
+        # Create a static connection for use by the test-suite
+        if context.settings.get("debug.test_suite_endpoint"):
+            mgr = ConnectionManager(self.context)
+            their_endpoint = context.settings["debug.test_suite_endpoint"]
+            test_conn = await mgr.create_static_connection(
+                my_seed=hashlib.sha256(b"aries-protocol-test-subject").digest(),
+                their_seed=hashlib.sha256(b"aries-protocol-test-suite").digest(),
+                their_endpoint=their_endpoint,
+                their_role="tester",
+                alias="test-suite",
+            )
+            print("Created static connection for test suite")
+            print(" - My DID:", test_conn.my_did)
+            print(" - Their DID:", test_conn.their_did)
+            print(" - Their endpoint:", their_endpoint)
+            print()
 
         # Print an invitation to the terminal
         if context.settings.get("debug.print_invitation"):
@@ -249,6 +277,7 @@ class Conductor:
             delivery.connection_id = connection.connection_id
 
         if single_response and not socket_id:
+            # if transport wasn't a socket, make a virtual socket used for responses
             socket = SocketInfo(single_response=single_response)
             socket_id = socket.socket_id
             self.sockets[socket_id] = socket
@@ -266,7 +295,7 @@ class Conductor:
                 socket_id = None
 
         delivery.socket_id = socket_id
-        socket = self.sockets[socket_id] if socket_id else None
+        socket: SocketInfo = self.sockets[socket_id] if socket_id else None
 
         if socket:
             socket.process_incoming(parsed_msg, delivery)
@@ -279,12 +308,47 @@ class Conductor:
                 delivery.transport_type,
             )
 
-        complete = await self.dispatcher.dispatch(
+        handler_done = await self.dispatcher.dispatch(
             parsed_msg, delivery, connection, self.outbound_message_router
         )
+        return asyncio.ensure_future(self.complete_dispatch(handler_done, socket))
+
+    async def complete_dispatch(self, dispatch: asyncio.Future, socket: SocketInfo):
+        """Wait for the dispatch to complete and perform final actions."""
+        await dispatch
+        await self.queue_processing(socket)
         if socket:
-            complete.add_done_callback(lambda fut: socket.dispatch_complete())
-        return complete
+            socket.dispatch_complete()
+
+    async def queue_processing(self, socket: SocketInfo):
+        """
+        Interact with undelivered queue to find applicable messages.
+
+        Args:
+            socket: The incoming socket connection
+        """
+        if (
+            socket
+            and socket.reply_mode
+            and not socket.closed
+            and self.undelivered_queue
+        ):
+            for key in socket.reply_verkeys:
+                if not isinstance(key, str):
+                    key = key.value
+                if self.undelivered_queue.has_message_for_key(key):
+                    for (
+                        undelivered_message
+                    ) in self.undelivered_queue.inspect_all_messages_for_key(key):
+                        # pending message. Transmit, then kill single_response
+                        if socket.select_outgoing(undelivered_message):
+                            self.logger.debug(
+                                "Sending Queued Message via inbound connection"
+                            )
+                            self.undelivered_queue.remove_message_for_key(
+                                key, undelivered_message
+                            )
+                            await socket.send(undelivered_message)
 
     async def get_connection_target(
         self, connection_id: str, context: InjectionContext = None
@@ -383,17 +447,17 @@ class Conductor:
             self.logger.debug("Returned message to socket %s", sel_socket.socket_id)
             return
 
+        try:
+            await self.prepare_outbound_message(message, context)
+        except MessagePrepareError:
+            self.logger.exception("Error preparing outbound message for transmission")
+            return
+
         # deliver directly to endpoint
         if message.endpoint:
-            try:
-                await self.prepare_outbound_message(message, context)
-            except MessagePrepareError:
-                self.logger.exception(
-                    "Error preparing outbound message for transmission"
-                )
-                return
-
             await self.outbound_transport_manager.send_message(message)
             return
 
-        self.logger.warning("No endpoint or direct route for outbound message, dropped")
+        # Add message to outbound queue, indexed by key
+        if self.undelivered_queue:
+            self.undelivered_queue.add_message(message)

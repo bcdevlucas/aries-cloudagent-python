@@ -1,6 +1,5 @@
 """Connection handling admin routes."""
 
-import asyncio
 import json
 from json.decoder import JSONDecodeError
 
@@ -14,6 +13,7 @@ from ...wallet.error import WalletNotFoundError
 from ...messaging.problem_report.message import ProblemReport
 
 from ..connections.models.connection_record import ConnectionRecord
+from ..valid import INDY_CRED_DEF_ID, INDY_REV_REG_ID, INDY_SCHEMA_ID
 
 from .manager import CredentialManager
 from .models.credential_exchange import CredentialExchange, CredentialExchangeSchema
@@ -76,10 +76,60 @@ class CredentialStoreRequestSchema(Schema):
     credential_id = fields.Str(required=False)
 
 
+class RawEncCredAttrSchema(Schema):
+    """Credential attribute schema."""
+
+    raw = fields.Str(description="Raw value", example="Alex")
+    encoded = fields.Str(
+        description="(Numeric string) encoded value",
+        example="412821674062189604125602903860586582569826459817431467861859655321"
+    )
+
+
+class RevRegSchema(Schema):
+    """Revocation registry schema."""
+
+    accum = fields.Str(
+        description="Revocation registry accumulator state",
+        example="21 136D54EA439FC26F03DB4b812 21 123DE9F624B86823A00D ..."
+    )
+
+
+class WitnessSchema(Schema):
+    """Witness schema."""
+
+    omega = fields.Str(
+        description="Revocation registry witness omega state",
+        example="21 129EA8716C921058BB91826FD 21 8F19B91313862FE916C0 ..."
+    )
+
+
 class CredentialSchema(Schema):
     """Result schema for a credential query."""
 
-    # properties undefined
+    schema_id = fields.Str(
+        description="Schema identifier",
+        **INDY_SCHEMA_ID
+    )
+    cred_def_id = fields.Str(
+        description="Credential definition identifier",
+        **INDY_CRED_DEF_ID
+    )
+    rev_reg_id = fields.Str(
+        description="Revocation registry identifier",
+        **INDY_REV_REG_ID
+    )
+    values = fields.Dict(
+        keys=fields.Str(
+            description="Attribute name"
+        ),
+        values=fields.Nested(RawEncCredAttrSchema),
+        description="Attribute names mapped to their raw and encoded values"
+    )
+    signature = fields.Dict(description="Digital signature")
+    signature_correctness_proof = fields.Dict(description="Signature correctness proof")
+    rev_reg = fields.Nested(RevRegSchema)
+    witness = fields.Nested(WitnessSchema)
 
 
 class CredentialListSchema(Schema):
@@ -213,6 +263,9 @@ async def credential_exchange_list(request: web.BaseRequest):
     """
     context = request.app["request_context"]
     tag_filter = {}
+    if "thread_id" in request.query and request.query["thread_id"] != "":
+        tag_filter["thread_id"] = request.query["thread_id"]
+    post_filter = {}
     for param_name in (
         "connection_id",
         "initiator",
@@ -221,8 +274,8 @@ async def credential_exchange_list(request: web.BaseRequest):
         "schema_id",
     ):
         if param_name in request.query and request.query[param_name] != "":
-            tag_filter[param_name] = request.query[param_name]
-    records = await CredentialExchange.query(context, tag_filter)
+            post_filter[param_name] = request.query[param_name]
+    records = await CredentialExchange.query(context, tag_filter, post_filter)
     return web.json_response({"results": [record.serialize() for record in records]})
 
 
@@ -292,13 +345,14 @@ async def credential_exchange_send(request: web.BaseRequest):
     if not connection_record.is_ready:
         raise web.HTTPForbidden()
 
-    credential_exchange_record = await credential_manager.prepare_send(
-        credential_definition_id, connection_id, credential_values
-    )
-    asyncio.ensure_future(
-        credential_manager.perform_send(credential_exchange_record, outbound_handler)
+    (
+        credential_exchange_record,
+        credential_offer_message,
+    ) = await credential_manager.create_offer(
+        credential_definition_id, connection_id, True, credential_values
     )
 
+    await outbound_handler(credential_offer_message, connection_id=connection_id)
     return web.json_response(credential_exchange_record.serialize())
 
 
@@ -337,16 +391,14 @@ async def credential_exchange_send_offer(request: web.BaseRequest):
     if not connection_record.is_ready:
         raise web.HTTPForbidden()
 
-    credential_exchange_record = await credential_manager.create_offer(
-        credential_definition_id, connection_id
-    )
-
     (
         credential_exchange_record,
         credential_offer_message,
-    ) = await credential_manager.offer_credential(credential_exchange_record)
-    await outbound_handler(credential_offer_message, connection_id=connection_id)
+    ) = await credential_manager.create_offer(
+        credential_definition_id, connection_id
+    )
 
+    await outbound_handler(credential_offer_message, connection_id=connection_id)
     return web.json_response(credential_exchange_record.serialize())
 
 
@@ -552,7 +604,6 @@ async def credential_exchange_remove(request: web.BaseRequest):
     context = request.app["request_context"]
     credential_exchange_id = request.match_info["id"]
     try:
-        credential_exchange_id = request.match_info["id"]
         credential_exchange_record = await CredentialExchange.retrieve_by_id(
             context, credential_exchange_id
         )

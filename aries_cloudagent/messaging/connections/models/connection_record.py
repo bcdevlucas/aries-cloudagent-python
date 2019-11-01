@@ -5,6 +5,7 @@ import json
 from typing import Sequence
 
 from marshmallow import fields
+from marshmallow.validate import OneOf
 
 from ....config.injection_context import InjectionContext
 from ....storage.base import BaseStorage
@@ -12,12 +13,13 @@ from ....storage.record import StorageRecord
 
 from ...models.base_record import BaseRecord, BaseRecordSchema
 from ...util import time_now
+from ...valid import INDY_DID, INDY_RAW_PUBLIC_KEY, UUIDFour
 
 from ..messages.connection_invitation import ConnectionInvitation
 from ..messages.connection_request import ConnectionRequest
 
 
-class ConnectionRecord(BaseRecord):
+class ConnectionRecord(BaseRecord):  # lgtm[py/missing-equals]
     """Represents a single pairwise connection."""
 
     class Meta:
@@ -30,6 +32,12 @@ class ConnectionRecord(BaseRecord):
     WEBHOOK_TOPIC_ACTIVITY = "connections_activity"
     LOG_STATE_FLAG = "debug.connections"
     CACHE_ENABLED = True
+    TAG_NAMES = {
+        "my_did",
+        "their_did",
+        "request_id",
+        "invitation_key",
+    }
 
     RECORD_TYPE = "connection"
     RECORD_TYPE_ACTIVITY = "connection_activity"
@@ -106,26 +114,19 @@ class ConnectionRecord(BaseRecord):
     @property
     def record_value(self) -> dict:
         """Accessor to for the JSON record value properties for this connection."""
-        return {"error_msg": self.error_msg, "their_label": self.their_label}
-
-    @property
-    def record_tags(self) -> dict:
-        """Accessor for the record tags generated for this connection."""
         return {
             prop: getattr(self, prop)
             for prop in (
-                "my_did",
-                "their_did",
+                "initiator",
                 "their_role",
                 "inbound_connection_id",
-                "initiator",
-                "invitation_key",
-                "request_id",
-                "state",
                 "routing_state",
                 "accept",
                 "invitation_mode",
-                "alias"
+                "alias",
+                "error_msg",
+                "their_label",
+                "state",
             )
         }
 
@@ -150,9 +151,10 @@ class ConnectionRecord(BaseRecord):
             tag_filter["their_did"] = their_did
         if my_did:
             tag_filter["my_did"] = my_did
+        post_filter = {}
         if initiator:
-            tag_filter["initiator"] = initiator
-        return await cls.retrieve_by_tag_filter(context, tag_filter)
+            post_filter["initiator"] = initiator
+        return await cls.retrieve_by_tag_filter(context, tag_filter, post_filter)
 
     @classmethod
     async def retrieve_by_invitation_key(
@@ -165,10 +167,11 @@ class ConnectionRecord(BaseRecord):
             invitation_key: The key on the originating invitation
             initiator: Filter by the initiator value
         """
-        tag_filter = {"invitation_key": invitation_key, "state": cls.STATE_INVITATION}
+        tag_filter = {"invitation_key": invitation_key}
+        post_filter = {"state": cls.STATE_INVITATION}
         if initiator:
-            tag_filter["initiator"] = initiator
-        return await cls.retrieve_by_tag_filter(context, tag_filter)
+            post_filter["initiator"] = initiator
+        return await cls.retrieve_by_tag_filter(context, tag_filter, post_filter)
 
     @classmethod
     async def retrieve_by_request_id(
@@ -375,17 +378,66 @@ class ConnectionRecordSchema(BaseRecordSchema):
 
         model_class = ConnectionRecord
 
-    connection_id = fields.Str(required=False)
-    my_did = fields.Str(required=False)
-    their_did = fields.Str(required=False)
-    their_label = fields.Str(required=False)
-    their_role = fields.Str(required=False)
-    inbound_connection_id = fields.Str(required=False)
-    initiator = fields.Str(required=False)
-    invitation_key = fields.Str(required=False)
-    request_id = fields.Str(required=False)
-    routing_state = fields.Str(required=False)
-    accept = fields.Str(required=False)
-    error_msg = fields.Str(required=False)
-    invitation_mode = fields.Str(required=False)
-    alias = fields.Str(required=False)
+    connection_id = fields.Str(
+        required=False, description="Connection identifier", example=UUIDFour.EXAMPLE
+    )
+    my_did = fields.Str(
+        required=False, description="Our DID for connection", **INDY_DID
+    )
+    their_did = fields.Str(
+        required=False, description="Their DID for connection", **INDY_DID
+    )
+    their_label = fields.Str(
+        required=False, description="Their label for connection", example="Bob"
+    )
+    their_role = fields.Str(
+        required=False,
+        description="Their assigned role for connection",
+        example="Point of contact",
+    )
+    inbound_connection_id = fields.Str(
+        required=False,
+        description="Inbound routing connection id to use",
+        example=UUIDFour.EXAMPLE,
+    )
+    initiator = fields.Str(
+        required=False,
+        description="Connection initiator: self, external, or multiuse",
+        example=ConnectionRecord.INITIATOR_SELF,
+        validate=OneOf(["self", "external", "multiuse"]),
+    )
+    invitation_key = fields.Str(
+        required=False, description="Public key for connection", **INDY_RAW_PUBLIC_KEY
+    )
+    request_id = fields.Str(
+        required=False,
+        description="Connection request identifier",
+        example=UUIDFour.EXAMPLE,
+    )
+    routing_state = fields.Str(
+        required=False,
+        description="Routing state of connection",
+        example=ConnectionRecord.ROUTING_STATE_ACTIVE,
+    )
+    accept = fields.Str(
+        required=False,
+        description="Connection acceptance: manual or auto",
+        example=ConnectionRecord.ACCEPT_AUTO,
+        validate=OneOf(["manual", "auto"]),
+    )
+    error_msg = fields.Str(
+        required=False,
+        description="Error message",
+        example="No DIDDoc provided; cannot connect to public DID",
+    )
+    invitation_mode = fields.Str(
+        required=False,
+        description="Invitation mode: once or multi",
+        example=ConnectionRecord.INVITATION_MODE_ONCE,
+        validate=OneOf(["once", "multi"]),
+    )
+    alias = fields.Str(
+        required=False,
+        description="Optional alias to apply to connection for later use",
+        example="Bob, providing quotes",
+    )
